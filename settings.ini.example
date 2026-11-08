@@ -1,0 +1,8 @@
+[signal]
+# Phone number registered with signal-cli-rest-api (international format)
+phone_number = +491234567890
+# Address of the signal-cli-rest-api service
+api_url = localhost:8080
+# How to connect to the service: https_only, http_only, or auto
+# (auto tries HTTPS/WSS first and falls back to HTTP/WS)
+connection_mode = auto
