@@ -221,3 +221,6 @@ __marimo__/
 
 # Local settings
 settings.ini
+
+# Bot state
+signalli.db

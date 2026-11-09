@@ -6,3 +6,40 @@ api_url = localhost:8080
 # How to connect to the service: https_only, http_only, or auto
 # (auto tries HTTPS/WSS first and falls back to HTTP/WS)
 connection_mode = auto
+# Your own number: the only one the bot answers and sends the check-in to
+owner_number = +491701234567
+
+[ai]
+# Optional extra text appended to the chat system prompt
+add_system_prompt =
+
+[openai]
+# OpenAI-compatible endpoint (Ollama); /v1 is appended automatically
+api_url = http://192.168.0.170
+api_port = 11434
+model = ministral-3:8b
+# api_key = not-needed
+
+[wyoming]
+# Wyoming faster-whisper server. Start it with --language auto for German + English
+api_url = 192.168.0.170
+api_port = 10300
+# Optional: force a language (de, en). Empty = server decides
+language =
+
+[diary]
+# Time of the daily check-in (24h, local time of the machine running the bot)
+reminder_time = 21:00
+# Initial parameters; change them later in chat with /add and /remove
+parameters = mood, pain, energy, sleep
+# Local SQLite file for bot state (parameters, which messages are reminders)
+state_db = signalli.db
+
+[smb]
+server = nas.local
+share = diary
+# Folder inside the share; files go to <base_dir>/<YYYY>/<YYYY-MM-DD>/
+base_dir = signalli
+username = diary_user
+password = secret
+# port = 445
