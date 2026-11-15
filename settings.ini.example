@@ -22,12 +22,26 @@ model = ministral-3:8b
 # temperature = 0
 # api_key = not-needed
 
+[asr]
+# Speech-to-text backend:
+#   speaches: OpenAI-compatible Speaches server, /vocab terms are sent with every request
+#   wyoming:  Wyoming faster-whisper server, /vocab only works via --initial-prompt + server restart
+backend = speaches
+# Optional: force a language (de, en). Empty = auto-detect (unreliable on short clips)
+language =
+
+[speaches]
+# OpenAI-compatible Speaches server; /v1 is appended automatically
+api_url = http://192.168.0.170
+api_port = 8000
+# Model id as Speaches knows it (download it on the server first)
+model = Systran/faster-whisper-large-v3
+# api_key = not-needed
+
 [wyoming]
-# Wyoming faster-whisper server. Start it with --language auto for German + English
+# Wyoming faster-whisper server, only used with backend = wyoming
 api_url = 192.168.0.170
 api_port = 10300
-# Optional: force a language (de, en). Empty = server decides
-language =
 
 [diary]
 # Time of the daily check-in (24h, local time of the machine running the bot)

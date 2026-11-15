@@ -31,6 +31,7 @@ from connectors import (
     smb_write_bytes,
     smb_write_json,
     transcribe_bytes,
+    transcribe_openai,
 )
 from prompts import CHAT_SYSTEM_PROMPT, DIARY_REMINDER, RATING_REMINDER
 
@@ -56,10 +57,23 @@ class Diary:
         extra = config.get("ai", "add_system_prompt", fallback="").strip()
         self.chat_system_prompt = CHAT_SYSTEM_PROMPT + ("\n" + extra if extra else "")
 
-        wyoming = config["wyoming"]
-        self.asr_host = wyoming["api_url"]
-        self.asr_port = int(wyoming["api_port"])
-        self.asr_language = wyoming.get("language") or None
+        # Speech-to-text: "wyoming" (vocabulary only via server restart) or "speaches" (vocabulary per request)
+        self.asr_backend = config.get("asr", "backend", fallback="wyoming").strip().lower()
+        if self.asr_backend not in ("wyoming", "speaches"):
+            raise ValueError(f"[asr] backend must be wyoming or speaches, not {self.asr_backend!r}")
+        self.asr_language = (
+            config.get("asr", "language", fallback="") or config.get("wyoming", "language", fallback="")
+        ).strip() or None
+
+        if self.asr_backend == "wyoming":
+            wyoming = config["wyoming"]
+            self.asr_host = wyoming["api_url"]
+            self.asr_port = int(wyoming["api_port"])
+        else:
+            speaches = config["speaches"]
+            self.asr_url = f"{speaches['api_url'].rstrip('/')}:{speaches['api_port']}/v1"
+            self.asr_model = speaches.get("model", "Systran/faster-whisper-large-v3")
+            self.asr_api_key = speaches.get("api_key", "not-needed")
 
         diary = config["diary"]
         self.default_reminder_time = diary.get("reminder_time", "21:00")
@@ -86,6 +100,21 @@ class Diary:
     @parameters.setter
     def parameters(self, value: list[str]) -> None:
         self.bot.storage.save("parameters", value)
+
+    # ---- vocabulary (names and terms the transcription should get right) --------
+
+    @property
+    def vocabulary(self) -> list[str]:
+        return self._setting("vocabulary", [])
+
+    @vocabulary.setter
+    def vocabulary(self, value: list[str]) -> None:
+        self.bot.storage.save("vocabulary", value)
+
+    @property
+    def initial_prompt(self) -> str:
+        """The vocabulary as faster-whisper initial prompt (--initial-prompt of the Wyoming server)."""
+        return ", ".join(self.vocabulary) + "." if self.vocabulary else ""
 
     # ---- settings changeable in chat (stored, config value is the default) -------
 
@@ -158,10 +187,32 @@ class Diary:
             is_audio = attachment.is_voice_note or (attachment.content_type or "").startswith("audio/")
             if is_audio and attachment.base64_content:
                 audio = base64.b64decode(attachment.base64_content)
-                text = await transcribe_bytes(audio, self.asr_host, self.asr_port, self.asr_language)
+                text = await self.transcribe(audio)
                 extension = mimetypes.guess_extension(attachment.content_type or "") or ".bin"
                 return text.strip(), audio, extension
         return (context.message.text or "").strip(), None, None
+
+    async def transcribe(self, audio: bytes) -> str:
+        if self.asr_backend == "speaches":
+            return await transcribe_openai(
+                audio,
+                url=self.asr_url,
+                model=self.asr_model,
+                api_key=self.asr_api_key,
+                language=self.asr_language,
+                prompt=self.initial_prompt or None,
+            )
+        return await transcribe_bytes(audio, self.asr_host, self.asr_port, self.asr_language)
+
+    @property
+    def transcript_model(self) -> str:
+        """Stored with each voice diary entry."""
+        return f"speaches:{self.asr_model}" if self.asr_backend == "speaches" else "wyoming"
+
+    @property
+    def vocab_needs_restart(self) -> bool:
+        """Wyoming only knows the --initial-prompt given at server start."""
+        return self.asr_backend == "wyoming"
 
     # ---- storage ----------------------------------------------------------------
 
@@ -208,7 +259,7 @@ class Diary:
                 audio_name = f"diary_{received:%H%M%S}_{signal_timestamp % 1000:03d}{extension}"
                 await self.smb(smb_write_bytes, self.day_path(date, audio_name), audio)
                 entry["audio_file"] = audio_name
-                entry["transcript_model"] = "wyoming"
+                entry["transcript_model"] = self.transcript_model
 
             path = self.day_path(date, "diary.json")
             data = await self.smb(smb_read_json, path) or {
@@ -262,13 +313,15 @@ class PingCommand(DataMessageHandler):
 
 
 class SlashCommand:
-    def __init__(self, command: str, method, helpstr: str, usage: str = "") -> None:
+    def __init__(self, command: str, method, helpstr: str, usage: str = "", raw_args: bool = False) -> None:
         assert callable(method), "method must be callable"
         assert command.startswith("/"), "command must start with /"
 
         self.command = command.lower()
         self.method = method
         self.usage = usage
+        # raw_args: the method gets the text after the command as one string instead of a word list
+        self.raw_args = raw_args
         self._helpstr = helpstr
 
     def matches(self, command: str) -> bool:
@@ -328,6 +381,14 @@ class SlashCommandHandler(DataMessageHandler):
                 method=self._cmd_model,
                 usage="[list|<name>]",
                 helpstr="no arg: show the model, list: list all available models, <name>: change the model",
+            ),
+            SlashCommand(
+                command="/vocab",
+                method=self._cmd_vocab,
+                usage="[add|remove <term>, ... | prompt]",
+                helpstr="no arg: show the transcription vocabulary, add/remove: comma-separated terms "
+                "(remove also takes numbers), prompt: show the Whisper prompt built from it",
+                raw_args=True,
             ),
         ])
 
@@ -412,17 +473,75 @@ class SlashCommandHandler(DataMessageHandler):
         self.diary.llm_model = name
         return f"Model set to {name}"
 
+    def _cmd_vocab(self, text: str) -> str:
+        def listing(vocabulary: list[str]) -> str:
+            if not vocabulary:
+                return "Vocabulary: empty"
+            return "Vocabulary:\n" + "\n".join(f"{i}. {term}" for i, term in enumerate(vocabulary, 1))
+
+        vocabulary = self.diary.vocabulary
+        action, rest = (text.split(maxsplit=1) + ["", ""])[:2]
+        action = action.lower()
+        terms = [t.strip() for t in rest.split(",") if t.strip()]
+
+        if not action:
+            return listing(vocabulary)
+
+        if action == "prompt":
+            if not vocabulary:
+                return "Vocabulary is empty, nothing to put into the prompt."
+            prompt = self.diary.initial_prompt
+            if self.diary.vocab_needs_restart:
+                text = f"Start the Wyoming faster-whisper server with:\n--initial-prompt \"{prompt}\""
+            else:
+                text = f"Sent with every transcription request:\n{prompt}"
+            if len(prompt) > 600:  # Whisper keeps only ~224 prompt tokens
+                text += "\n⚠️ Long prompt, Whisper may cut off the end."
+            return text
+
+        if action not in ("add", "remove") or not terms:
+            return "Usage: " + self._find_cmd("/vocab").helpstr
+
+        lowered = [v.lower() for v in vocabulary]
+        if action == "add":
+            added = []
+            for term in terms:
+                if term.lower() not in lowered:
+                    vocabulary.append(term)
+                    lowered.append(term.lower())
+                    added.append(term)
+            self.diary.vocabulary = vocabulary
+            reply = listing(vocabulary)
+            if added and self.diary.vocab_needs_restart:
+                reply += "\n\nRestart the Whisper server with the new prompt to use it, see /vocab prompt"
+            return reply
+
+        # remove: by term (case-insensitive) or by list number
+        remove, missing = set(), []
+        for term in terms:
+            if term.isdigit() and 1 <= int(term) <= len(vocabulary):
+                remove.add(int(term) - 1)
+            elif term.lower() in lowered:
+                remove.add(lowered.index(term.lower()))
+            else:
+                missing.append(term)
+        self.diary.vocabulary = vocabulary = [v for i, v in enumerate(vocabulary) if i not in remove]
+        reply = listing(vocabulary)
+        if missing:
+            reply += f"\nNot found: {', '.join(missing)}"
+        return reply
+
     @regex_triggered(r"^/")
     async def handle_data_message(self, context: DataMessageContext) -> None:
         if not context.message.source_number == self.diary.owner:
             logging.exception("message from unknown source came through")
             return
 
-        command, *args = context.message.text.strip().split()
-        args = [a.strip(",") for a in args if a.strip(",")]
+        command, raw = (context.message.text.split(maxsplit=1) + [""])[:2]
+        args = [a.strip(",") for a in raw.split() if a.strip(",")]
 
         cmd = self._find_cmd(command)
-        result = (cmd.method if cmd else self._cmd_help)(args)
+        result = (cmd.method if cmd else self._cmd_help)(raw.strip() if cmd and cmd.raw_args else args)
         if inspect.isawaitable(result):
             result = await result
         if result:

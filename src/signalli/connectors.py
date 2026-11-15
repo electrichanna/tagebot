@@ -1,3 +1,4 @@
+import io
 import json
 import errno
 import asyncio
@@ -10,7 +11,7 @@ from wyoming.client import AsyncTcpClient
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioStart, AudioChunk, AudioStop
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from prompts import PARSE_SYSTEM_PROMPT, CHAT_SYSTEM_PROMPT
 
@@ -144,3 +145,33 @@ async def transcribe_bytes(audio: bytes, host="localhost", port=10300, language:
             if Transcript.is_type(event.type):
                 return Transcript.from_event(event).text
     raise RuntimeError("No transcript received")
+
+
+async def transcribe_openai(
+    audio: bytes,
+    url: str,
+    model: str,
+    api_key: str = "not-needed",
+    language: str | None = None,
+    prompt: str | None = None,
+    timeout: int = 300,
+) -> str:
+    """Transcribe via an OpenAI-compatible endpoint (e.g. Speaches). `prompt` biases the vocabulary."""
+    pcm = await to_pcm(audio)
+    wav = io.BytesIO()
+    with wave.open(wav, "wb") as f:
+        f.setnchannels(CHANNELS)
+        f.setsampwidth(WIDTH)
+        f.setframerate(RATE)
+        f.writeframes(pcm)
+
+    options = {}
+    if language:
+        options["language"] = language
+    if prompt:
+        options["prompt"] = prompt
+    async with AsyncOpenAI(base_url=url, api_key=api_key, timeout=timeout) as client:
+        result = await client.audio.transcriptions.create(
+            model=model, file=("audio.wav", wav.getvalue(), "audio/wav"), **options
+        )
+    return result.text
