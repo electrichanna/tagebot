@@ -18,6 +18,8 @@ add_system_prompt =
 api_url = http://192.168.0.170
 api_port = 11434
 model = ministral-3:8b
+# Chat temperature (0-2); change later with /temp
+# temperature = 0
 # api_key = not-needed
 
 [wyoming]
@@ -30,7 +32,7 @@ language =
 [diary]
 # Time of the daily check-in (24h, local time of the machine running the bot)
 reminder_time = 21:00
-# Initial parameters; change them later in chat with /add and /remove
+# Initial parameters; change them later in chat with /params add and /params remove
 parameters = mood, pain, energy, sleep
 # Local SQLite file for bot state (parameters, which messages are reminders)
 state_db = signalli.db

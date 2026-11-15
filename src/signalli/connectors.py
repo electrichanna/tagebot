@@ -60,7 +60,7 @@ def ollama_parse_response(text: str, parameters: list[str], timeout: int = 120, 
 
 
 
-def ollama_response_message(text: str, timeout: int = 120, url: str = "http://127.0.0.1:11434/v1", api_key:str = "not-needed", model:str = None, history: list[dict] | None = None, system_prompt: str = CHAT_SYSTEM_PROMPT) -> str:
+def ollama_response_message(text: str, timeout: int = 120, url: str = "http://127.0.0.1:11434/v1", api_key:str = "not-needed", model:str = None, history: list[dict] | None = None, system_prompt: str = CHAT_SYSTEM_PROMPT, temperature: float = 0) -> str:
     """Normal chat answer. `history` is a list of earlier {"role", "content"} messages."""
 
     if model is None:
@@ -79,9 +79,16 @@ def ollama_response_message(text: str, timeout: int = 120, url: str = "http://12
             *(history or []),
             {"role": "user", "content": text}
             ],
+        temperature=temperature,
     )
 
     return response.choices[0].message.content
+
+
+def ollama_list_models(timeout: int = 30, url: str = "http://127.0.0.1:11434/v1", api_key: str = "not-needed") -> list[str]:
+    """Names of all models the endpoint offers, sorted."""
+    client = OpenAI(base_url=url, api_key=api_key, timeout=timeout)
+    return sorted(m.id for m in client.models.list())
 
 
 def smb_register(server: str, username: str, password: str, port: int = 445) -> None:

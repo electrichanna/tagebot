@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import configparser
+import inspect
 import logging
 import mimetypes
 import ntpath
@@ -22,6 +23,7 @@ from signalbot import (
 
 from connectors import (
     OLLAMA_MODEL,
+    ollama_list_models,
     ollama_parse_response,
     ollama_response_message,
     smb_read_json,
@@ -31,6 +33,8 @@ from connectors import (
     transcribe_bytes,
 )
 from prompts import CHAT_SYSTEM_PROMPT, DIARY_REMINDER, RATING_REMINDER
+
+REMINDER_JOB_ID = "evening-reminder"
 
 
 def now_iso() -> str:
@@ -46,7 +50,8 @@ class Diary:
 
         openai = config["openai"]
         self.llm_url = f"{openai['api_url'].rstrip('/')}:{openai['api_port']}/v1"
-        self.llm_model = openai.get("model", OLLAMA_MODEL)
+        self.default_llm_model = openai.get("model", OLLAMA_MODEL)
+        self.default_temperature = openai.getfloat("temperature", fallback=0.0)
         self.llm_api_key = openai.get("api_key", "not-needed")
         extra = config.get("ai", "add_system_prompt", fallback="").strip()
         self.chat_system_prompt = CHAT_SYSTEM_PROMPT + ("\n" + extra if extra else "")
@@ -57,7 +62,7 @@ class Diary:
         self.asr_language = wyoming.get("language") or None
 
         diary = config["diary"]
-        self.reminder_time = diary.get("reminder_time", "21:00")
+        self.default_reminder_time = diary.get("reminder_time", "21:00")
         self.default_parameters = [
             p.strip().lower() for p in diary.get("parameters", "mood, pain").split(",") if p.strip()
         ]
@@ -82,7 +87,45 @@ class Diary:
     def parameters(self, value: list[str]) -> None:
         self.bot.storage.save("parameters", value)
 
+    # ---- settings changeable in chat (stored, config value is the default) -------
+
+    def _setting(self, key: str, default):
+        return self.bot.storage.read(key) if self.bot.storage.exists(key) else default
+
+    @property
+    def llm_model(self) -> str:
+        return self._setting("llm_model", self.default_llm_model)
+
+    @llm_model.setter
+    def llm_model(self, value: str) -> None:
+        self.bot.storage.save("llm_model", value)
+
+    @property
+    def temperature(self) -> float:
+        return self._setting("temperature", self.default_temperature)
+
+    @temperature.setter
+    def temperature(self, value: float) -> None:
+        self.bot.storage.save("temperature", value)
+
+    @property
+    def reminder_time(self) -> str:
+        """HH:MM, local time."""
+        return self._setting("reminder_time", self.default_reminder_time)
+
+    @reminder_time.setter
+    def reminder_time(self, value: str) -> None:
+        self.bot.storage.save("reminder_time", value)
+        self.schedule_reminder()
+
     # ---- reminders --------------------------------------------------------------
+
+    def schedule_reminder(self) -> None:
+        """(Re)create the daily reminder job at the current reminder_time."""
+        hour, minute = self.reminder_time.split(":")
+        self.bot.scheduler.add_job(
+            self.send_reminder, "cron", hour=int(hour), minute=int(minute), id=REMINDER_JOB_ID, replace_existing=True
+        )
 
     async def send_reminder(self) -> None:
         date = datetime.now().date().isoformat()
@@ -199,10 +242,17 @@ class Diary:
             model=self.llm_model,
             history=history,
             system_prompt=self.chat_system_prompt,
+            temperature=self.temperature,
         )
+
+    async def list_models(self) -> list[str]:
+        return await asyncio.to_thread(ollama_list_models, url=self.llm_url, api_key=self.llm_api_key)
 
 
 class PingCommand(DataMessageHandler):
+    def __init__(self, diary: Diary) -> None:
+        self.diary = diary
+
     @text_triggered("Ping")
     async def handle_data_message(self, context: DataMessageContext) -> None:
         if not context.message.source_number == self.diary.owner:
@@ -211,19 +261,156 @@ class PingCommand(DataMessageHandler):
         await context.send(SendMessage(text="Pong"))
 
 
-class SlashCommand(DataMessageHandler):
-    """/params, /add <name>..., /remove <name>..., /remind, /help"""
+class SlashCommand:
+    def __init__(self, command: str, method, helpstr: str, usage: str = "") -> None:
+        assert callable(method), "method must be callable"
+        assert command.startswith("/"), "command must start with /"
 
-    HELP = (
-        "/params – show the parameters\n"
-        "/add <name> [<name> ...] – add parameters\n"
-        "/remove <name> [<name> ...] – remove parameters\n"
-        "/remind – send the evening check-in now\n"
-        "/help – this help"
-    )
+        self.command = command.lower()
+        self.method = method
+        self.usage = usage
+        self._helpstr = helpstr
+
+    def matches(self, command: str) -> bool:
+        # exact match, so e.g. /param does not catch /params
+        return command.lower() == self.command
+
+    @property
+    def helpstr(self) -> str:
+        """returns full help line, including command, usage and help text"""
+        usage = f" {self.usage}" if self.usage else ""
+        return f"{self.command}{usage} - {self._helpstr}"
+
+    @helpstr.setter
+    def helpstr(self, value: str) -> None:
+        """set the help string (only the description part)"""
+        self._helpstr = value
+
+
+class SlashCommandHandler(DataMessageHandler):
+    """Dispatches /commands to the registered SlashCommands. Unknown commands show the help."""
 
     def __init__(self, diary: Diary) -> None:
         self.diary = diary
+        self.commands: list[SlashCommand] = []
+
+        self._add_cmd([
+            SlashCommand(
+                command="/help",
+                method=self._cmd_help,
+                helpstr="this help",
+            ),
+            SlashCommand(
+                command="/params",
+                method=self._cmd_params,
+                usage="[add|remove <name> ...]",
+                helpstr="no arg: show parameters, add: add parameters, remove: remove parameters",
+            ),
+            SlashCommand(
+                command="/remind",
+                method=self._cmd_remind,
+                helpstr="send the evening check-in now",
+            ),
+            SlashCommand(
+                command="/temp",
+                method=self._cmd_temp,
+                usage="[<0-2>]",
+                helpstr="show or change the chat temperature",
+            ),
+            SlashCommand(
+                command="/schedule",
+                method=self._cmd_schedule,
+                usage="[HHMM]",
+                helpstr="show or change the check-in time (e.g. 2130 for 21:30)",
+            ),
+            SlashCommand(
+                command="/model",
+                method=self._cmd_model,
+                usage="[list|<name>]",
+                helpstr="no arg: show the model, list: list all available models, <name>: change the model",
+            ),
+        ])
+
+    def _add_cmd(self, command: SlashCommand | list[SlashCommand]) -> None:
+        if isinstance(command, list):
+            self.commands.extend(command)
+        else:
+            self.commands.append(command)
+
+    def _find_cmd(self, command: str) -> SlashCommand | None:
+        return next((cmd for cmd in self.commands if cmd.matches(command)), None)
+
+    # ---- commands: each takes the arguments and returns the reply (None = no reply) ----
+
+    def _cmd_help(self, args: list[str]) -> str:
+        return "\n".join(cmd.helpstr for cmd in self.commands)
+
+    def _cmd_params(self, args: list[str]) -> str:
+        parameters = self.diary.parameters
+        if not args:
+            return "Parameters: " + (", ".join(parameters) or "none")
+
+        action, *names = (a.lower() for a in args)
+        if action not in ("add", "remove") or not names:
+            return "Usage: " + self._find_cmd("/params").helpstr
+
+        if action == "add":
+            invalid = [n for n in names if not re.fullmatch(r"[\w-]+", n)]
+            if invalid:
+                return f"Invalid name(s): {', '.join(invalid)} (letters, digits, _ and - only)"
+            parameters += [n for n in names if n not in parameters]
+            self.diary.parameters = parameters
+            return "Parameters: " + ", ".join(parameters)
+
+        missing = [n for n in names if n not in parameters]
+        self.diary.parameters = parameters = [p for p in parameters if p not in names]
+        text = "Parameters: " + (", ".join(parameters) or "none")
+        if missing:
+            text += f"\nNot found: {', '.join(missing)}"
+        return text
+
+    async def _cmd_remind(self, args: list[str]) -> None:
+        await self.diary.send_reminder()
+
+    def _cmd_temp(self, args: list[str]) -> str:
+        if not args:
+            return f"Temperature: {self.diary.temperature}"
+        try:
+            value = float(args[0].replace(",", "."))
+        except ValueError:
+            value = None
+        if value is None or not 0 <= value <= 2:
+            return "Temperature must be a number between 0 and 2"
+        self.diary.temperature = value
+        return f"Temperature set to {value}"
+
+    def _cmd_schedule(self, args: list[str]) -> str:
+        if not args:
+            return f"Check-in time: {self.diary.reminder_time}"
+        match = re.fullmatch(r"(\d{1,2}):?(\d{2})", args[0])
+        hour, minute = (int(g) for g in match.groups()) if match else (-1, -1)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return "Time must be HHMM or HH:MM, e.g. 2130"
+        self.diary.reminder_time = f"{hour:02d}:{minute:02d}"
+        return f"Check-in time set to {self.diary.reminder_time}"
+
+    async def _cmd_model(self, args: list[str]) -> str:
+        if not args:
+            return f"Model: {self.diary.llm_model}"
+        name = args[0]
+        try:
+            models = await self.diary.list_models()
+        except Exception:
+            logging.exception("Listing models failed")
+            return "⚠️ Could not fetch the model list."
+
+        if name.lower() == "list":
+            current = self.diary.llm_model
+            return "Models:\n" + "\n".join(f"{'▶' if m == current else '•'} {m}" for m in models)
+        if name not in models:
+            return f"Unknown model: {name}\nSee /model list"
+        self.diary.llm_model = name
+        return f"Model set to {name}"
 
     @regex_triggered(r"^/")
     async def handle_data_message(self, context: DataMessageContext) -> None:
@@ -232,33 +419,14 @@ class SlashCommand(DataMessageHandler):
             return
 
         command, *args = context.message.text.strip().split()
-        command = command.lower()
-        args = [a.strip(",").lower() for a in args if a.strip(",")]
-        parameters = self.diary.parameters
+        args = [a.strip(",") for a in args if a.strip(",")]
 
-        if command in ("/params", "/list"):
-            text = "Parameters: " + (", ".join(parameters) or "none")
-        elif command == "/add" and args:
-            invalid = [a for a in args if not re.fullmatch(r"[\w-]+", a)]
-            if invalid:
-                text = f"Invalid name(s): {', '.join(invalid)} (letters, digits, _ and - only)"
-            else:
-                parameters += [a for a in args if a not in parameters]
-                self.diary.parameters = parameters
-                text = "Parameters: " + ", ".join(parameters)
-        elif command == "/remove" and args:
-            missing = [a for a in args if a not in parameters]
-            self.diary.parameters = parameters = [p for p in parameters if p not in args]
-            text = "Parameters: " + (", ".join(parameters) or "none")
-            if missing:
-                text += f"\nNot found: {', '.join(missing)}"
-        elif command == "/remind":
-            await self.diary.send_reminder()
-            return
-        else:
-            text = self.HELP
-
-        await context.send(SendMessage(text=text))
+        cmd = self._find_cmd(command)
+        result = (cmd.method if cmd else self._cmd_help)(args)
+        if inspect.isawaitable(result):
+            result = await result
+        if result:
+            await context.send(SendMessage(text=result))
 
 
 class MessageHandler(DataMessageHandler):
@@ -356,11 +524,10 @@ if __name__ == "__main__":
 
     # Only answer the owner's number, never groups. Commands win over chat (priority).
     only_me = {"contacts": [diary.owner], "groups": False}
-    bot.register(PingCommand(), **only_me, priority=2)
-    bot.register(SlashCommand(diary), **only_me, priority=2)
+    bot.register(PingCommand(diary), **only_me, priority=2)
+    bot.register(SlashCommandHandler(diary), **only_me, priority=2)
     bot.register(MessageHandler(diary), **only_me, priority=1)
 
-    hour, minute = diary.reminder_time.split(":")
-    bot.scheduler.add_job(diary.send_reminder, "cron", hour=int(hour), minute=int(minute))
+    diary.schedule_reminder()
 
     bot.start()
