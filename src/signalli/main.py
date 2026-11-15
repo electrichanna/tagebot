@@ -205,6 +205,9 @@ class Diary:
 class PingCommand(DataMessageHandler):
     @text_triggered("Ping")
     async def handle_data_message(self, context: DataMessageContext) -> None:
+        if not context.message.source_number == self.diary.owner:
+            logging.exception("message from unknown source came through")
+            return
         await context.send(SendMessage(text="Pong"))
 
 
@@ -224,6 +227,10 @@ class SlashCommand(DataMessageHandler):
 
     @regex_triggered(r"^/")
     async def handle_data_message(self, context: DataMessageContext) -> None:
+        if not context.message.source_number == self.diary.owner:
+            logging.exception("message from unknown source came through")
+            return
+
         command, *args = context.message.text.strip().split()
         command = command.lower()
         args = [a.strip(",").lower() for a in args if a.strip(",")]
@@ -262,6 +269,10 @@ class MessageHandler(DataMessageHandler):
         self.history: deque[dict] = deque(maxlen=20)
 
     async def handle_data_message(self, context: DataMessageContext) -> None:
+        if not context.message.source_number == self.diary.owner:
+            logging.exception("message from unknown source came through")
+            return
+
         reminder = self.diary.reminder_for(context)
         try:
             text, audio, extension = await self.diary.read_input(context)
