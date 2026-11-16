@@ -67,6 +67,18 @@ The bot only answers your own number (`TAGEBOT_SIGNAL__OWNER_NUMBER`) and ignore
 
 An unknown command also shows the help.
 
+## Private by default
+
+It is possible (and advised) to run tagebot using only local inference. This is possible by having an Ollama instance and Wyoming-faster-whisper or Speaches running on your local machine or within your local network.
+
+tagebot itself has no telemetry and only talks to the services you set in `.env`. This is where your data goes:
+
+- **Signal:** messages are end-to-end encrypted between your phone and signal-cli-rest-api, which runs on your own machine. Signal's servers only pass on the encrypted messages.
+- **Language model and speech-to-text:** your ratings, diary entries, chat messages and voice messages are sent to `TAGEBOT_LLM__URL` and `TAGEBOT_SPEACHES__URL` (or the Wyoming host). With local servers nothing leaves your network. You can also use a cloud API (any OpenAI-compatible one works), but then everything you send to the bot ends up with that provider.
+- **Storage:** diary entries, ratings, audio files and settings are only written to your SMB share.
+
+Internet access is only needed for Signal and once for downloading the models.
+
 ## Stored data
 
 Everything is written to the SMB share; tagebot keeps no data of its own, so the container can be rebuilt or moved freely.
@@ -161,18 +173,22 @@ cd tagebot
 cp .env.example .env
 ```
 
-Set at least the variables in the [table below](#configuration). Leave `TAGEBOT_SMB__PASSWORD_FILE=secrets/smb_password` as it is; the password goes into a separate file in the next step.
+Set at least the variables in the [table below](#configuration). Leave `TAGEBOT_SMB__PASSWORD_FILE=secrets/smb_password` as it is to use Docker secrets or change it to `TAGEBOT_SMB__PASSWORD=yourpassword` to just put the password as plaintext in your environment (not recommended);
 
-### 4. Store the SMB password as a secret
+### 4. Store the secrets (SMB password and API keys)
 
 ```sh
 mkdir -m 700 secrets
-printf 'SMB password: '; stty -echo; read -r pw; stty echo; echo
-printf '%s' "$pw" > secrets/smb_password; unset pw
+touch secrets/smb_password
+nano secrets/smb_password      # type your password in the file
 chmod 644 secrets/smb_password
 ```
 
-This keeps the password off the screen and out of the shell history. See [Secrets](#secrets) for why the permissions are set this way.
+The file holds only the password; a line break at the end is ignored. Writing it in an editor keeps it out of the shell history.
+
+The folder is private (`700`) so other users on the host can't read the files. The files themselves have to be readable for the bot's user inside the container (`644`). Compose mounts each file directly, so the folder permission doesn't apply there.
+
+If your LLM or Speaches endpoint needs an API key, put it in `secrets/llm_api_key` or `secrets/speaches_api_key` and enable the matching `_FILE` line in `.env`. For Docker, also add it as a secret in `docker-compose.yml` the same way as `smb_password`, with `TAGEBOT_LLM__API_KEY_FILE: /run/secrets/llm_api_key` (or the Speaches equivalent) under `environment`.
 
 ### 5. Set up signal-cli-rest-api in `json-rpc` mode
 
@@ -252,18 +268,6 @@ All settings are environment variables named `TAGEBOT_<SECTION>__<KEY>` (two und
 
 Missing or invalid values stop the bot at startup with a list of the affected variables.
 
-### Secrets
-
-Passwords and API keys are not written in `.env`. They live in a `secrets/` folder, one file per secret containing only the value, and `.env` points to them with `<NAME>_FILE` variables (any variable can be read from a file this way). With Docker, Compose mounts the same files as [Docker secrets](https://docs.docker.com/compose/how-tos/use-secrets/) under `/run/secrets/` and sets the paths itself, so one `.env` works with and without Docker.
-
-The folder is private (`700`) so other users on the host can't read the files. The files themselves have to be readable for the bot's user inside the container (`644`). Compose mounts each file directly, so the folder permission doesn't apply there.
-
-If your LLM or Speaches endpoint needs an API key, put it in `secrets/llm_api_key` or `secrets/speaches_api_key` and enable the matching `_FILE` line in `.env`. For Docker, also add it as a secret in `docker-compose.yml` the same way as `smb_password`, with `TAGEBOT_LLM__API_KEY_FILE: /run/secrets/llm_api_key` (or the Speaches equivalent) under `environment`.
-
-Setting `TAGEBOT_SMB__PASSWORD` directly still works, but puts the password in plain text in `.env`.
-
-`.env` and `secrets/` are in `.gitignore` and `.dockerignore`, so they are never committed or copied into the image.
-
 ## Run without Docker
 
 Follow steps 1–5 above, then start the bot from the repository root (`.env` is read from the current directory):
@@ -284,6 +288,111 @@ uv run src/tagebot/main.py
     ├── settings.py      # configuration from environment variables
     ├── connectors.py    # Ollama (OpenAI API), Speaches/Wyoming transcription, SMB storage
     └── prompts.py       # system prompts and check-in texts
+```
+
+## Running on NixOS
+
+This is how I run tagebot on my NixOS machine. Everything runs on one machine: signal-cli-rest-api, tagebot and Speaches as Docker containers, Ollama as a NixOS service. The GPU part is for an NVIDIA card; leave it out to run on the CPU.
+
+Add this to your `configuration.nix` (it needs `config` and `pkgs` in the module arguments):
+
+```nix
+# User that owns the tagebot files
+users.users.diary = {
+  isSystemUser = true;
+  group = "diary";
+  home = "/var/lib/diary";
+  createHome = true;
+};
+users.groups.diary = { };
+systemd.tmpfiles.rules = [ "d /var/lib/diary/secrets 0700 diary diary -" ];
+
+environment.systemPackages = [ pkgs.git ];
+
+# NVIDIA GPU for Ollama and Speaches (optional)
+nixpkgs.config.allowUnfree = true;
+nixpkgs.config.cudaSupport = true;
+services.xserver.videoDrivers = [ "nvidia" ];
+hardware.nvidia.open = true;
+hardware.nvidia.package = config.boot.kernelPackages.nvidiaPackages.stable;
+hardware.nvidia-container-toolkit.enable = true;
+
+virtualisation.docker.enable = true;
+virtualisation.docker.daemon.settings.features.cdi = true;  # GPU access for containers
+virtualisation.oci-containers.backend = "docker";
+
+virtualisation.oci-containers.containers = {
+  signal-api = {
+    image = "bbernhard/signal-cli-rest-api:0.101";
+    environment.MODE = "json-rpc";
+    ports = [ "127.0.0.1:8080:8080" ];  # localhost only
+    volumes = [ "/home/hanni/.local/share/signal-api:/home/.local/share/signal-cli" ];
+  };
+
+  speaches = {
+    image = "ghcr.io/speaches-ai/speaches:latest-cuda";  # or :latest-cpu without a GPU
+    ports = [ "127.0.0.1:8000:8000" ];
+    volumes = [ "hf-hub-cache:/home/ubuntu/.cache/huggingface/hub" ];
+    extraOptions = [ "--device=nvidia.com/gpu=all" ];  # remove without a GPU
+  };
+
+  tagebot = {
+    image = "tagebot:latest";  # built locally, see below
+    dependsOn = [ "signal-api" "speaches" ];
+    extraOptions = [ "--network=host" ];  # reaches the other services on 127.0.0.1
+    environmentFiles = [ "/var/lib/diary/tagebot.env" ];
+    environment = {
+      TAGEBOT_SIGNAL__API_URL = "127.0.0.1:8080";
+      TAGEBOT_SMB__PASSWORD_FILE = "/run/secrets/smb_password";
+    };
+    volumes = [ "/var/lib/diary/secrets/smb_password:/run/secrets/smb_password:ro" ];
+  };
+};
+
+services.ollama = {
+  enable = true;
+  package = pkgs.ollama-cuda;  # or pkgs.ollama without a GPU
+  loadModels = [ "ministral-3:8b" ];
+};
+```
+
+After `sudo nixos-rebuild switch`:
+
+1. **Get the code and build the image:**
+   ```sh
+   sudo -u diary git clone https://github.com/electrichanna/tagebot.git /var/lib/diary/src
+   sudo docker build -t tagebot:latest /var/lib/diary/src
+   ```
+2. **Configure:** copy `.env.example` to `/var/lib/diary/tagebot.env` and fill it in. Because tagebot uses the host network, point it at localhost:
+   ```sh
+   TAGEBOT_LLM__URL=http://127.0.0.1:11434
+   TAGEBOT_SPEACHES__URL=http://127.0.0.1:8000
+   ```
+3. **Store the SMB password** in `/var/lib/diary/secrets/smb_password` as in [step 4](#4-store-the-secrets-smb-password-and-api-keys) (`chmod 644`; the folder is already private).
+4. **Download the Speaches model** once:
+   ```sh
+   curl -X POST http://127.0.0.1:8000/v1/models/Systran/faster-whisper-large-v3
+   ```
+5. **Link the Signal number:** port 8080 is only open on the machine itself, so tunnel to it with `ssh -L 8080:localhost:8080 <nixos-host>` and open `http://localhost:8080/v1/qrcodelink?device_name=tagebot` on your computer (see [step 5](#5-set-up-signal-cli-rest-api-in-json-rpc-mode)).
+6. **Start tagebot:** `sudo systemctl restart docker-tagebot`, logs with `journalctl -u docker-tagebot -f`.
+
+To update:
+
+```sh
+sudo -u diary git -C /var/lib/diary/src pull
+sudo docker build -t tagebot:latest /var/lib/diary/src
+sudo systemctl restart docker-tagebot
+```
+
+### Without Docker on NixOS
+
+The Docker image already contains ffmpeg. To [run tagebot with uv](#run-without-docker) directly on NixOS instead, ffmpeg has to be on the `PATH`. Binaries that uv downloads (its Python and prebuilt wheels) expect libraries in the usual Linux locations, which NixOS doesn't have; `nix-ld` provides them, including the ffmpeg libraries for software that links against them:
+
+```nix
+environment.systemPackages = with pkgs; [ git uv ffmpeg ];
+
+programs.nix-ld.enable = true;
+programs.nix-ld.libraries = with pkgs; [ ffmpeg_8-headless ];
 ```
 
 ## License
