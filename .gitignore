@@ -219,8 +219,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Local settings
+# Local settings (.env is ignored above) and Docker secrets
 settings.ini
+secrets/
 
 # Bot state
-signalli.db
+data/

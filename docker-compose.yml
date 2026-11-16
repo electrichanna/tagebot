@@ -1,0 +1,34 @@
+services:
+  tagebot:
+    build: .
+    image: tagebot
+    restart: unless-stopped
+    env_file: .env
+    # Secrets are mounted as /run/secrets/<name>; this wins over the local path in .env.
+    # API keys (if needed) are added the same way as smb_password
+    environment:
+      TAGEBOT_SMB__PASSWORD_FILE: /run/secrets/smb_password
+    secrets:
+      - smb_password
+
+  # Optional bundled signal-cli-rest-api: enable with COMPOSE_PROFILES=signal in .env (or
+  # `docker compose --profile signal up -d`) and set TAGEBOT_SIGNAL__API_URL=signal-api:8080.
+  # Skip it if you already run one elsewhere.
+  signal-api:
+    image: bbernhard/signal-cli-rest-api:0.101
+    profiles: [signal]
+    restart: unless-stopped
+    environment:
+      MODE: json-rpc # required: tagebot receives messages over the json-rpc WebSocket
+    ports:
+      - "8080:8080" # only needed to register or link the number from outside
+    volumes:
+      - signal-cli-data:/home/.local/share/signal-cli
+
+volumes:
+  signal-cli-data:
+
+# One file per secret, containing only the value
+secrets:
+  smb_password:
+    file: ./secrets/smb_password

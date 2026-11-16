@@ -1,11 +1,15 @@
 [project]
-name = "signalli"
+name = "tagebot"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "openai>=3.48.0",
+    "pydantic-settings>=2.16.3",
+    "python-dotenv>=1.2.4",
     "signalbot>=2.2.1",
     "smbprotocol>=1.17.0",
     "wyoming>=1.11.0",

@@ -1,8 +1,8 @@
-# signalli
+# tagebot
 
-A personal Signal bot for a daily check-in and diary, with a local AI chat on the side.
+A personal Signal bot for a daily check-in and diary, with a local AI chat on the side. The name comes from German *Tagebuch* (diary) + bot.
 
-Every evening signalli asks you to rate a few parameters (mood, pain, energy, …) from 1 to 10 and asks what happened during the day. You answer in Signal with text or voice messages, in German or English. The answers are stored on an SMB share on your local network. Any other message you send gets a normal AI chat reply.
+Every evening tagebot asks you to rate a few parameters (e.g. mood, pain, energy) from 1 to 10 and asks what happened during the day. You answer in Signal with text or voice messages, in German or English. The answers are stored on an SMB share on your local network. Any other message you send gets a normal AI chat reply.
 
 Everything runs locally: [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) for Signal, [Ollama](https://ollama.com) for the language model and [Speaches](https://github.com/speaches-ai/speaches) or a [Wyoming](https://github.com/rhasspy/wyoming) faster-whisper server for speech-to-text.
 
@@ -23,33 +23,65 @@ Only messages sent as a **reply** to one of these two messages (long-press → R
 | A message starting with `/` | A command, see below |
 | Anything else | Normal AI chat (the last 10 exchanges are kept as context) |
 
-Replies are filed under the date of the reminder they answer, so replying the next morning still counts for the right day.
+Replies are filed under the date the check-in was sent, so replying the next morning still counts for the right day. The bot recognises its check-ins by their first line, so replies to older check-ins keep working after restarts.
 
-The bot only answers the number set as `owner_number` and ignores groups.
+The bot only answers your own number (`TAGEBOT_SIGNAL__OWNER_NUMBER`) and ignores groups.
 
 ### Commands
 
+**Check-in**
+
 | Command | Description |
 | --- | --- |
-| `/params` | Show the current parameters |
-| `/add <name> [<name> …]` | Add parameters |
-| `/remove <name> [<name> …]` | Remove parameters |
 | `/remind` | Send the check-in now |
-| `/help` | Show the command list |
+| `/schedule` | Show the check-in time |
+| `/schedule <HHMM>` | Change the check-in time, e.g. `2130` for 21:30 (`21:30` works too) |
+| `/params` | Show the rating parameters |
+| `/params add <name> …` | Add parameters (letters, digits, `_` and `-`) |
+| `/params remove <name> …` | Remove parameters |
+
+**Chat**
+
+| Command | Description |
+| --- | --- |
+| `/model` | Show the current model |
+| `/model list` | List all available models |
+| `/model <name>` | Switch to another model |
+| `/temp` | Show the chat temperature |
+| `/temp <0-2>` | Change the chat temperature |
+
+**Voice messages**
+
+| Command | Description |
+| --- | --- |
+| `/vocab` | Show the transcription vocabulary |
+| `/vocab add <term>, …` | Add comma-separated terms (names, words the transcription should get right) |
+| `/vocab remove <term\|number>, …` | Remove terms by name or list number |
+
+**General**
+
+| Command | Description |
+| --- | --- |
+| `/help` | Show the command list and a link to the source code |
 | `Ping` | Answers `Pong` (connection test) |
+
+An unknown command also shows the help.
 
 ## Stored data
 
-Files are written to the SMB share, one folder per day:
+Everything is written to the SMB share; tagebot keeps no data of its own, so the container can be rebuilt or moved freely.
 
 ```
 <share>/<base_dir>/
+├── settings.json                   # settings changed in chat
 └── 2026/
     └── 2026-11-09/
         ├── parameters.json         # ratings + metadata
         ├── diary.json              # diary entries (text and transcripts)
-        └── diary_210100_456.aac    # raw audio of a voice entry
+        └── diary_211228_456.aac    # raw audio of a voice entry
 ```
+
+`settings.json` holds what you changed with `/params`, `/vocab`, `/model`, `/temp` and `/schedule`; these values override the defaults from `.env`. You can also edit the file by hand; the bot picks that up after a restart or the next change. If the share is not reachable at startup, the bot uses the defaults and retries every 5 minutes.
 
 `parameters.json`
 
@@ -87,80 +119,173 @@ Files are written to the SMB share, one folder per day:
       "type": "voice",
       "text": "Heute war ein guter Tag.",
       "audio_file": "diary_211228_456.aac",
-      "transcript_model": "wyoming"
+      "transcript_model": "speaches:Systran/faster-whisper-large-v3"
     }
   ]
 }
 ```
 
-Bot state (the parameter list and which messages are reminders) is kept locally in `signalli.db` (SQLite).
-
 ## Requirements
 
-- Python 3.12+ and [uv](https://docs.astral.sh/uv/)
-- `ffmpeg` on the `PATH` (converts voice messages for transcription)
-- [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) ≥ 0.101.0 in `json-rpc` mode, with a number registered for the bot (a separate number from your own)
-- [Ollama](https://ollama.com) with a model that supports structured output (default `ministral-3:8b`)
+- Docker with Compose, **or** Python 3.12+ with [uv](https://docs.astral.sh/uv/) and `ffmpeg` on the `PATH`
+- [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) ≥ 0.101.0 **in `json-rpc` mode** (`MODE=json-rpc`), with a number registered for the bot (a separate number from your own). tagebot receives messages over the WebSocket that only this mode provides; in the default `normal` or `native` mode the bot connects but never sees any messages. `docker-compose.yml` can start one in the right mode for you.
+- [Ollama](https://ollama.com) (or another OpenAI-compatible API) with a model that supports structured output (default `ministral-3:8b`)
 - A speech-to-text server: [Speaches](https://github.com/speaches-ai/speaches) (recommended, OpenAI-compatible) or a Wyoming faster-whisper server
 - An SMB share with username/password access
 
-## Setup
+## Getting started
+
+A step-by-step setup with Docker. [Configuration](#configuration) below explains the settings in detail.
+
+### 1. Prepare the services
+
+- **A phone number for the bot**, separate from your own (e.g. a second SIM or a landline that can receive an SMS or call).
+- **Ollama with the model:** `ollama pull ministral-3:8b`. Check it from the machine that will run tagebot: `curl http://<ollama-host>:11434/v1/models` should list it.
+- **Speaches with the model**, downloaded once:
+  ```sh
+  curl -X POST http://<speaches-host>:8000/v1/models/Systran/faster-whisper-large-v3
+  ```
+  Or a Wyoming faster-whisper server instead (set `TAGEBOT_ASR__BACKEND=wyoming`).
+- **An SMB share** on your NAS and a user that can write to it.
+
+### 2. Get the code
 
 ```sh
-git clone git@github.com:electrichanna/signalli.git
-cd signalli
+git clone https://github.com/electrichanna/tagebot.git
+cd tagebot
+```
+
+### 3. Fill in `.env`
+
+```sh
+cp .env.example .env
+```
+
+Set at least the variables in the [table below](#configuration). Leave `TAGEBOT_SMB__PASSWORD_FILE=secrets/smb_password` as it is; the password goes into a separate file in the next step.
+
+### 4. Store the SMB password as a secret
+
+```sh
+mkdir -m 700 secrets
+printf 'SMB password: '; stty -echo; read -r pw; stty echo; echo
+printf '%s' "$pw" > secrets/smb_password; unset pw
+chmod 644 secrets/smb_password
+```
+
+This keeps the password off the screen and out of the shell history. See [Secrets](#secrets) for why the permissions are set this way.
+
+### 5. Set up signal-cli-rest-api in `json-rpc` mode
+
+tagebot only works with signal-cli-rest-api in `json-rpc` mode (see [Requirements](#requirements)).
+
+**Using one you already run:** make sure it is started with `MODE=json-rpc` and the bot number is registered there. Set `TAGEBOT_SIGNAL__API_URL` to its `host:port` and continue with step 6.
+
+**Using the bundled one:** it is already configured with `MODE: json-rpc` in `docker-compose.yml`. Add these to `.env`:
+
+```env
+TAGEBOT_SIGNAL__API_URL=signal-api:8080
+COMPOSE_PROFILES=signal
+```
+
+Start only that service and connect the bot number:
+
+```sh
+docker compose up -d signal-api
+```
+
+- **Link** (easiest if the number is already a Signal account on a phone): open `http://localhost:8080/v1/qrcodelink?device_name=tagebot` in a browser, then scan the code on the phone under *Settings → Linked devices → +*.
+- **Register** the number fresh: follow the register and verify steps in the [signal-cli-rest-api docs](https://github.com/bbernhard/signal-cli-rest-api). Signal usually asks for a captcha.
+
+If linking or registering doesn't work in `json-rpc` mode, set `MODE: normal` in `docker-compose.yml`, connect the number, and **switch back to `MODE: json-rpc`** afterwards (`docker compose up -d signal-api`). Otherwise tagebot receives no messages.
+
+### 6. Start tagebot
+
+```sh
+docker compose up -d --build
+docker compose logs -f tagebot
+```
+
+If a setting is missing or invalid, the log names the exact variable. Fix it in `.env` and run `docker compose up -d` again.
+
+### 7. Test it
+
+From your own phone, message the bot:
+
+1. `Ping` → answers `Pong`.
+2. `/help` → shows the command list.
+3. `/remind` → both check-in messages arrive.
+4. Reply to the rating check-in (long-press → Reply) with e.g. `7 3 5 8` → the bot confirms the ratings.
+5. Reply to the diary check-in with a voice message → the bot sends the transcript and reacts with 📝.
+6. On the NAS, `<base_dir>/<year>/<date>/` now has `parameters.json`, `diary.json` and the audio file.
+
+If `Ping` gets no answer, check that signal-cli-rest-api runs in `json-rpc` mode and look at `docker compose logs tagebot`.
+
+### 8. Adjust in chat (optional)
+
+`/schedule 2130`, `/params add focus`, `/vocab add Hanna`, `/model list`. These are saved in `settings.json` on the share, so they survive rebuilds.
+
+### Updating
+
+```sh
+git pull
+docker compose up -d --build
+```
+
+## Configuration
+
+All settings are environment variables named `TAGEBOT_<SECTION>__<KEY>` (two underscores between section and key), read from `.env`. [.env.example](.env.example) lists every setting with its default. The required ones:
+
+| Variable | Meaning |
+| --- | --- |
+| `TZ` | Time zone for the check-in, e.g. `Europe/Berlin` |
+| `TAGEBOT_SIGNAL__PHONE_NUMBER` | Number the bot is registered with |
+| `TAGEBOT_SIGNAL__OWNER_NUMBER` | Your own number; the only one the bot answers |
+| `TAGEBOT_SIGNAL__API_URL` | Address of signal-cli-rest-api, e.g. `signal-api:8080` or `192.168.0.170:8080` |
+| `TAGEBOT_LLM__URL` | Ollama URL including the port, e.g. `http://192.168.0.170:11434` (`/v1` is added automatically) |
+| `TAGEBOT_ASR__BACKEND` | `speaches` (vocabulary sent per request) or `wyoming` (vocabulary needs a server restart) |
+| `TAGEBOT_SPEACHES__URL` | Speaches URL including the port, e.g. `http://192.168.0.170:8000` (for `speaches`) |
+| `TAGEBOT_WYOMING__HOST` | Wyoming host, e.g. `192.168.0.170` (for `wyoming`) |
+| `TAGEBOT_SMB__SERVER`, `TAGEBOT_SMB__SHARE` | NAS host/IP and share name |
+| `TAGEBOT_SMB__BASE_DIR` | Folder inside the share, e.g. `tagebot` (optional, default: top level) |
+| `TAGEBOT_SMB__USERNAME` | SMB user |
+| `TAGEBOT_SMB__PASSWORD_FILE` | File with the SMB password, `secrets/smb_password` (see [Secrets](#secrets)) |
+
+Missing or invalid values stop the bot at startup with a list of the affected variables.
+
+### Secrets
+
+Passwords and API keys are not written in `.env`. They live in a `secrets/` folder, one file per secret containing only the value, and `.env` points to them with `<NAME>_FILE` variables (any variable can be read from a file this way). With Docker, Compose mounts the same files as [Docker secrets](https://docs.docker.com/compose/how-tos/use-secrets/) under `/run/secrets/` and sets the paths itself, so one `.env` works with and without Docker.
+
+The folder is private (`700`) so other users on the host can't read the files. The files themselves have to be readable for the bot's user inside the container (`644`). Compose mounts each file directly, so the folder permission doesn't apply there.
+
+If your LLM or Speaches endpoint needs an API key, put it in `secrets/llm_api_key` or `secrets/speaches_api_key` and enable the matching `_FILE` line in `.env`. For Docker, also add it as a secret in `docker-compose.yml` the same way as `smb_password`, with `TAGEBOT_LLM__API_KEY_FILE: /run/secrets/llm_api_key` (or the Speaches equivalent) under `environment`.
+
+Setting `TAGEBOT_SMB__PASSWORD` directly still works, but puts the password in plain text in `.env`.
+
+`.env` and `secrets/` are in `.gitignore` and `.dockerignore`, so they are never committed or copied into the image.
+
+## Run without Docker
+
+Follow steps 1–5 above, then start the bot from the repository root (`.env` is read from the current directory):
+
+```sh
 uv sync
-cp settings.ini.example settings.ini
+uv run src/tagebot/main.py
 ```
-
-Fill in `settings.ini`:
-
-| Section | Key | Meaning |
-| --- | --- | --- |
-| `[signal]` | `phone_number` | Number the bot is registered with |
-| | `api_url` | Address of signal-cli-rest-api, e.g. `192.168.0.170:8080` |
-| | `connection_mode` | `https_only`, `http_only` or `auto` |
-| | `owner_number` | Your own number; the only one the bot answers |
-| `[ai]` | `add_system_prompt` | Optional extra text for the chat system prompt |
-| `[openai]` | `api_url` | Ollama host **without** port, e.g. `http://192.168.0.170` |
-| | `api_port` | Ollama port, usually `11434` (`/v1` is added automatically) |
-| | `model` | Model name, e.g. `ministral-3:8b` |
-| | `api_key` | Optional, not needed for Ollama |
-| `[asr]` | `backend` | `speaches` (vocabulary sent per request) or `wyoming` (vocabulary needs a server restart) |
-| | `language` | Empty for auto-detection, or `de` / `en` to force one language |
-| `[speaches]` | `api_url` | Speaches host **without** port, e.g. `http://192.168.0.170` |
-| | `api_port` | Usually `8000` (`/v1` is added automatically) |
-| | `model` | Model id, e.g. `Systran/faster-whisper-large-v3` (download it on the server first) |
-| `[wyoming]` | `api_url` | Host only, e.g. `192.168.0.170` (only for `backend = wyoming`) |
-| | `api_port` | Usually `10300` |
-| `[diary]` | `reminder_time` | Time of the daily check-in, 24h, e.g. `21:00` |
-| | `parameters` | Initial parameters, comma-separated (later changed with `/add` and `/remove`) |
-| | `state_db` | Local SQLite file for bot state |
-| `[smb]` | `server`, `share` | NAS host/IP and share name |
-| | `base_dir` | Folder inside the share |
-| | `username`, `password` | SMB credentials |
-| | `port` | Optional, default `445` |
-
-`settings.ini` is in `.gitignore`, so the credentials are not committed.
-
-## Run
-
-```sh
-uv run src/signalli/main.py
-```
-
-Send `Ping` to the bot to check the connection, then `/remind` to try the check-in without waiting for the evening.
 
 ## Project layout
 
 ```
-src/signalli/
-├── main.py         # handlers, diary logic, scheduler, startup
-├── connectors.py   # Ollama (OpenAI API), Speaches/Wyoming transcription, SMB storage
-├── prompts.py      # system prompts and reminder texts
-└── transcribe.py   # standalone transcription helper
+├── Dockerfile
+├── docker-compose.yml   # tagebot + optional signal-cli-rest-api
+├── .env.example         # all settings with their defaults
+└── src/tagebot/
+    ├── main.py          # handlers, diary logic, scheduler, startup
+    ├── settings.py      # configuration from environment variables
+    ├── connectors.py    # Ollama (OpenAI API), Speaches/Wyoming transcription, SMB storage
+    └── prompts.py       # system prompts and check-in texts
 ```
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later), see [LICENSE](LICENSE). If you run a modified version that other people use over a network, you have to offer them its source code.
