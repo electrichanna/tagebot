@@ -385,9 +385,9 @@ class SlashCommandHandler(DataMessageHandler):
             SlashCommand(
                 command="/vocab",
                 method=self._cmd_vocab,
-                usage="[add|remove <term>, ... | prompt]",
+                usage="[add|remove <term>, ...]",
                 helpstr="no arg: show the transcription vocabulary, add/remove: comma-separated terms "
-                "(remove also takes numbers), prompt: show the Whisper prompt built from it",
+                "(remove also takes numbers)",
                 raw_args=True,
             ),
         ])
@@ -487,18 +487,6 @@ class SlashCommandHandler(DataMessageHandler):
         if not action:
             return listing(vocabulary)
 
-        if action == "prompt":
-            if not vocabulary:
-                return "Vocabulary is empty, nothing to put into the prompt."
-            prompt = self.diary.initial_prompt
-            if self.diary.vocab_needs_restart:
-                text = f"Start the Wyoming faster-whisper server with:\n--initial-prompt \"{prompt}\""
-            else:
-                text = f"Sent with every transcription request:\n{prompt}"
-            if len(prompt) > 600:  # Whisper keeps only ~224 prompt tokens
-                text += "\n⚠️ Long prompt, Whisper may cut off the end."
-            return text
-
         if action not in ("add", "remove") or not terms:
             return "Usage: " + self._find_cmd("/vocab").helpstr
 
@@ -513,7 +501,7 @@ class SlashCommandHandler(DataMessageHandler):
             self.diary.vocabulary = vocabulary
             reply = listing(vocabulary)
             if added and self.diary.vocab_needs_restart:
-                reply += "\n\nRestart the Whisper server with the new prompt to use it, see /vocab prompt"
+                reply += "\n\nRestart the Whisper server with the new --initial-prompt to use it"
             return reply
 
         # remove: by term (case-insensitive) or by list number
